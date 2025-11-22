@@ -135,16 +135,41 @@ jobs:
           echo "Consul-replicate config:"
           cat /tmp/consul-replicate.hcl
       -
+        name: Verify DC1 data accessible from DC2 via WAN
+        run: |
+          echo "Testing if DC2 can read DC1 data via WAN..."
+          docker exec consul-dc2 consul kv get -datacenter=dc1 test/key1 || echo "Cannot read from DC1 via WAN"
+          docker exec consul-dc2 consul kv get -datacenter=dc1 -recurse test/ || echo "Cannot read from DC1 via WAN"
+      -
         name: Run consul-replicate to replicate from DC1 to DC2
         run: |
-          echo "Running consul-replicate..."
-          docker run --rm \
+          echo "Running consul-replicate with config file..."
+          OUTPUT=$(docker run --rm \
             --network consul-network \
             -v /tmp/consul-replicate.hcl:/consul-replicate.hcl \
             consul-replicate:test \
             -config /consul-replicate.hcl \
             -once \
-            2>&1 || echo "consul-replicate completed (exit code: $?)"
+            -log-level=debug \
+            2>&1) || true
+          echo "=== consul-replicate output (config file) ==="
+          echo "$OUTPUT"
+          echo "=== Exit code: $? ==="
+          
+          echo ""
+          echo "Trying with CLI flags..."
+          OUTPUT2=$(docker run --rm \
+            --network consul-network \
+            consul-replicate:test \
+            -consul-addr=consul-dc2:8500 \
+            -consul-dc=dc2 \
+            -prefix "test@dc1:test" \
+            -once \
+            -log-level=debug \
+            2>&1) || true
+          echo "=== consul-replicate output (CLI flags) ==="
+          echo "$OUTPUT2"
+          echo "=== Exit code: $? ==="
       -
         name: Verify data replicated to DC2
         run: |
