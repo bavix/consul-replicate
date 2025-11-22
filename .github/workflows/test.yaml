@@ -1,0 +1,220 @@
+name: test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@v4
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      -
+        name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: consul-replicate:test
+          load: true
+          build-args: |
+            version=test
+      -
+        name: Create Docker network
+        run: |
+          docker network create consul-network || true
+      -
+        name: Start Consul DC1 (server mode, not dev)
+        run: |
+          docker run -d \
+            --name consul-dc1 \
+            --network consul-network \
+            -p 8500:8500 \
+            -p 8300:8300 \
+            -p 8301:8301 \
+            -p 8302:8302/udp \
+            hashicorp/consul:latest agent -server \
+            -bootstrap-expect=1 \
+            -datacenter=dc1 \
+            -client=0.0.0.0 \
+            -ui
+          echo "Waiting for Consul DC1 to be ready..."
+          for i in {1..60}; do
+            if docker exec consul-dc1 consul members 2>/dev/null | grep -q "alive"; then
+              echo "Consul DC1 is ready"
+              break
+            fi
+            sleep 1
+          done
+          if [ $i -eq 60 ]; then
+            echo "ERROR: Consul DC1 failed to start"
+            docker logs consul-dc1
+            exit 1
+          fi
+      -
+        name: Start Consul DC2 (server mode, not dev)
+        run: |
+          docker run -d \
+            --name consul-dc2 \
+            --network consul-network \
+            -p 8501:8500 \
+            -p 8303:8300 \
+            -p 8304:8301 \
+            -p 8305:8302/udp \
+            hashicorp/consul:latest agent -server \
+            -bootstrap-expect=1 \
+            -datacenter=dc2 \
+            -client=0.0.0.0 \
+            -ui
+          echo "Waiting for Consul DC2 to be ready..."
+          for i in {1..60}; do
+            if docker exec consul-dc2 consul members 2>/dev/null | grep -q "alive"; then
+              echo "Consul DC2 is ready"
+              break
+            fi
+            sleep 1
+          done
+          if [ $i -eq 60 ]; then
+            echo "ERROR: Consul DC2 failed to start"
+            docker logs consul-dc2
+            exit 1
+          fi
+      -
+        name: Join DC1 and DC2 via WAN
+        run: |
+          DC1_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' consul-dc1)
+          DC2_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' consul-dc2)
+          echo "DC1 IP: $DC1_IP"
+          echo "DC2 IP: $DC2_IP"
+          echo "Joining DC2 to DC1 via WAN..."
+          docker exec consul-dc2 consul join -wan ${DC1_IP}:8302
+          sleep 3
+          echo "DC1 WAN members:"
+          docker exec consul-dc1 consul members -wan || echo "No WAN members in DC1"
+          echo "DC2 WAN members:"
+          docker exec consul-dc2 consul members -wan || echo "No WAN members in DC2"
+      -
+        name: Add test data to DC1
+        run: |
+          docker exec consul-dc1 consul kv put test/key1 "value1"
+          docker exec consul-dc1 consul kv put test/key2 "value2"
+          docker exec consul-dc1 consul kv put test/nested/key3 "value3"
+          echo "Test data added to DC1:"
+          docker exec consul-dc1 consul kv get -recurse test/
+      -
+        name: Verify DC2 is empty
+        run: |
+          echo "DC2 should be empty initially:"
+          docker exec consul-dc2 consul kv get -recurse test/ 2>&1 || echo "DC2 is empty (as expected)"
+      -
+        name: Create consul-replicate config
+        run: |
+          cat > /tmp/consul-replicate.hcl << 'EOF'
+          consul {
+            address = "consul-dc2:8500"
+          }
+          
+          prefix {
+            source      = "test"
+            datacenter  = "dc1"
+            destination = "test"
+          }
+          
+          log_level = "debug"
+          EOF
+          echo "Consul-replicate config:"
+          cat /tmp/consul-replicate.hcl
+      -
+        name: Verify DC1 data accessible from DC2 via WAN
+        run: |
+          echo "Testing if DC2 can read DC1 data via WAN..."
+          docker exec consul-dc2 consul kv get -datacenter=dc1 test/key1 || echo "Cannot read from DC1 via WAN"
+          docker exec consul-dc2 consul kv get -datacenter=dc1 -recurse test/ || echo "Cannot read from DC1 via WAN"
+      -
+        name: Run consul-replicate to replicate from DC1 to DC2
+        run: |
+          echo "Running consul-replicate with config file..."
+          OUTPUT=$(docker run --rm \
+            --network consul-network \
+            -v /tmp/consul-replicate.hcl:/consul-replicate.hcl \
+            consul-replicate:test \
+            -config /consul-replicate.hcl \
+            -once \
+            -log-level=debug \
+            2>&1) || true
+          echo "=== consul-replicate output (config file) ==="
+          echo "$OUTPUT"
+          echo "=== Exit code: $? ==="
+          
+          echo ""
+          echo "Trying with CLI flags..."
+          OUTPUT2=$(docker run --rm \
+            --network consul-network \
+            consul-replicate:test \
+            -consul-addr=consul-dc2:8500 \
+            -prefix "test@dc1:test" \
+            -once \
+            -log-level=debug \
+            2>&1) || true
+          echo "=== consul-replicate output (CLI flags) ==="
+          echo "$OUTPUT2"
+          echo "=== Exit code: $? ==="
+      -
+        name: Verify data replicated to DC2
+        run: |
+          echo "Checking data in DC2:"
+          docker exec consul-dc2 consul kv get -recurse test/ || echo "No data found"
+          KEY1=$(docker exec consul-dc2 consul kv get test/key1 2>/dev/null | tail -1 || echo "")
+          KEY2=$(docker exec consul-dc2 consul kv get test/key2 2>/dev/null | tail -1 || echo "")
+          KEY3=$(docker exec consul-dc2 consul kv get test/nested/key3 2>/dev/null | tail -1 || echo "")
+          
+          echo ""
+          echo "=== DC1 data ==="
+          docker exec consul-dc1 consul kv get -recurse test/
+          echo ""
+          echo "=== DC2 data ==="
+          docker exec consul-dc2 consul kv get -recurse test/ || echo "No data in DC2"
+          
+          if [ "$KEY1" != "value1" ] || [ "$KEY2" != "value2" ] || [ "$KEY3" != "value3" ]; then
+            echo ""
+            echo "ERROR: Data replication failed!"
+            echo "Expected: value1, value2, value3"
+            echo "Got: KEY1='$KEY1', KEY2='$KEY2', KEY3='$KEY3'"
+            echo ""
+            echo "Debugging info:"
+            echo "DC1 members:"
+            docker exec consul-dc1 consul members || true
+            echo "DC2 members:"
+            docker exec consul-dc2 consul members || true
+            echo "DC1 WAN members:"
+            docker exec consul-dc1 consul members -wan || true
+            echo "DC2 WAN members:"
+            docker exec consul-dc2 consul members -wan || true
+            echo "DC1 logs (last 20 lines):"
+            docker logs consul-dc1 2>&1 | tail -20 || true
+            echo "DC2 logs (last 20 lines):"
+            docker logs consul-dc2 2>&1 | tail -20 || true
+            exit 1
+          fi
+          
+          echo ""
+          echo "SUCCESS: All data replicated to DC2"
+          echo "key1: $KEY1"
+          echo "key2: $KEY2"
+          echo "key3: $KEY3"
+      -
+        name: Cleanup
+        if: always()
+        run: |
+          docker stop consul-dc1 consul-dc2 || true
+          docker rm consul-dc1 consul-dc2 || true
+          docker network rm consul-network || true
