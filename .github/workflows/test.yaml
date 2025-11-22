@@ -121,7 +121,6 @@ jobs:
           cat > /tmp/consul-replicate.hcl << 'EOF'
           consul {
             address = "consul-dc2:8500"
-            datacenter = "dc2"
           }
           
           prefix {
@@ -162,7 +161,6 @@ jobs:
             --network consul-network \
             consul-replicate:test \
             -consul-addr=consul-dc2:8500 \
-            -consul-dc=dc2 \
             -prefix "test@dc1:test" \
             -once \
             -log-level=debug \
