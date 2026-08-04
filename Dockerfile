@@ -16,7 +16,7 @@ RUN apk --no-cache add git &&\
     cd - &&\
     rm -rf /tmp/consul-replicate
 
-FROM alpine:3.23
+FROM alpine:3.24
 WORKDIR /
 ENV USER=consul-replicate
 ENV UID=10001
